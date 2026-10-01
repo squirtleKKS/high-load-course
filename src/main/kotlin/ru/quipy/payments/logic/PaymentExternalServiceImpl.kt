@@ -2,15 +2,22 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.ratelimiter.RateLimiter
+import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.Semaphore
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -34,9 +41,62 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val deadlineReserveMs = requestAverageProcessingTime.toMillis() + 1000L
+
+    private val rateLimiter = RateLimiter.of(
+        "payments-$accountName",
+        RateLimiterConfig.custom()
+            .limitForPeriod(1)
+            .limitRefreshPeriod(Duration.ofMillis(1000L / rateLimitPerSec + 5))
+            .timeoutDuration(Duration.ofSeconds(60))
+            .build()
+    )
+
+    private val inFlight = Semaphore(parallelRequests)
+
+    private val executor = ThreadPoolExecutor(
+        parallelRequests,
+        parallelRequests,
+        0L,
+        TimeUnit.MILLISECONDS,
+        LinkedBlockingQueue(),
+        NamedThreadFactory("payment-worker-$accountName")
+    )
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        executor.submit {
+            processPayment(paymentId, amount, paymentStartedAt, deadline)
+        }
+    }
+
+    private fun processPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        while (System.currentTimeMillis() + deadlineReserveMs <= deadline) {
+            if (!rateLimiter.acquirePermission()) {
+                return
+            }
+            if (System.currentTimeMillis() + deadlineReserveMs > deadline) {
+                return
+            }
+            if (!inFlight.tryAcquire(5, TimeUnit.SECONDS)) {
+                return
+            }
+            val succeeded = try {
+                performPaymentAttempt(paymentId, amount, paymentStartedAt)
+            } finally {
+                inFlight.release()
+            }
+            if (succeeded) {
+                return
+            }
+        }
+    }
+
+    private fun performPaymentAttempt(paymentId: UUID, amount: Int, paymentStartedAt: Long): Boolean {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -49,6 +109,7 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+        var result = false
         try {
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
@@ -64,6 +125,8 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                result = body.result
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
@@ -89,6 +152,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         }
+        return result
     }
 
     override fun price() = properties.price
