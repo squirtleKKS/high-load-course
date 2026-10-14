@@ -3,6 +3,7 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.ratelimiter.RateLimiter
+import io.micrometer.core.instrument.MeterRegistry
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -26,6 +27,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -41,7 +43,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val deadlineReserveMs = requestAverageProcessingTime.toMillis() + 1000L
+    private val deadlineReserveMs = requestAverageProcessingTime.toMillis() * 2 + 500L
 
     private val rateLimiter = RateLimiter.of(
         "payments-$accountName",
@@ -74,15 +76,22 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
+    private fun decline(reason: String) {
+        meterRegistry.counter("payments_declined", "account", accountName, "reason", reason).increment()
+    }
+
     private fun processPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         while (System.currentTimeMillis() + deadlineReserveMs <= deadline) {
             if (!rateLimiter.acquirePermission()) {
+                decline("rate-limited")
                 return
             }
             if (System.currentTimeMillis() + deadlineReserveMs > deadline) {
+                decline("deadline-exceeded")
                 return
             }
             if (!inFlight.tryAcquire(5, TimeUnit.SECONDS)) {
+                decline("no-free-slot")
                 return
             }
             val succeeded = try {
@@ -94,9 +103,11 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
         }
+        decline("deadline-exceeded")
     }
 
     private fun performPaymentAttempt(paymentId: UUID, amount: Int, paymentStartedAt: Long): Boolean {
+        meterRegistry.counter("payment_attempts", "account", accountName).increment()
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
