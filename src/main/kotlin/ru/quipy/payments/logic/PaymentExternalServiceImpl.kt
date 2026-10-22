@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.ratelimiter.RateLimiter
 import io.micrometer.core.instrument.MeterRegistry
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
+import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -39,35 +40,38 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val deadlineReserveMs = requestAverageProcessingTime.toMillis() * 2 + 500L
+    private val deadlineReserveMs = 2150L
 
     private val rateLimiter = RateLimiter.of(
         "payments-$accountName",
         RateLimiterConfig.custom()
-            .limitForPeriod(1)
-            .limitRefreshPeriod(Duration.ofMillis(1000L / rateLimitPerSec + 5))
-            .timeoutDuration(Duration.ofSeconds(60))
+            .limitForPeriod(28)
+            .limitRefreshPeriod(Duration.ofMillis(257))
+            .timeoutDuration(Duration.ofMillis(500))
             .build()
     )
 
     private val inFlight = Semaphore(parallelRequests)
 
+    private val workerThreads = 112
+
+    private val queueCapacity = 128
+
     private val executor = ThreadPoolExecutor(
-        parallelRequests,
-        parallelRequests,
+        workerThreads,
+        workerThreads,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(),
+        LinkedBlockingQueue(queueCapacity),
         NamedThreadFactory("payment-worker-$accountName")
-    )
+    ) { _, _ -> decline("queue-full") }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
+        .connectionPool(ConnectionPool(workerThreads, 60, TimeUnit.SECONDS))
         .build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
