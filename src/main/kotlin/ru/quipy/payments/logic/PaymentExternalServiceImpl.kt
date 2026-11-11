@@ -2,9 +2,10 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import io.github.resilience4j.ratelimiter.RateLimiter
+import io.github.bucket4j.Bandwidth
+import io.github.bucket4j.Bucket
+import io.github.bucket4j.Refill
 import io.micrometer.core.instrument.MeterRegistry
-import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -17,7 +18,6 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.Semaphore
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -40,33 +40,54 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
+    private val requestAverageProcessingTime = properties.averageProcessingTime
+    private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val deadlineReserveMs = 2150L
+    private val deadlineReserveMs = requestAverageProcessingTime.toMillis() + 500L
+    private val admissionReserveMs = requestAverageProcessingTime.toMillis() * 2 + 200L
+    private val workerThreads = minOf(
+        parallelRequests.toLong(),
+        rateLimitPerSec * requestAverageProcessingTime.toMillis() / 1000L + 2
+    ).toInt()
+    private val queueCapacity = 512
+    private val pollTimeoutMs = 50L
+    private val retryBackoffMs = 400L
+    private val minEmissionGapMs = 1000L / rateLimitPerSec + 1
 
-    private val rateLimiter = RateLimiter.of(
-        "payments-$accountName",
-        RateLimiterConfig.custom()
-            .limitForPeriod(28)
-            .limitRefreshPeriod(Duration.ofMillis(257))
-            .timeoutDuration(Duration.ofMillis(500))
-            .build()
+    private val emissionBucket: Bucket = Bucket.builder()
+        .addLimit(
+            Bandwidth.classic(1, Refill.greedy(rateLimitPerSec.toLong(), Duration.ofSeconds(1)))
+        )
+        .build()
+
+    private data class PaymentTask(
+        val paymentId: UUID,
+        val amount: Int,
+        val paymentStartedAt: Long,
+        val deadline: Long,
     )
 
-    private val inFlight = Semaphore(parallelRequests)
+    private val taskQueue = LinkedBlockingQueue<PaymentTask>(queueCapacity)
 
-    private val workerThreads = 112
-
-    private val queueCapacity = 128
-
-    private val executor = ThreadPoolExecutor(
+    private val attemptExecutor = ThreadPoolExecutor(
         workerThreads,
         workerThreads,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(queueCapacity),
+        LinkedBlockingQueue(),
         NamedThreadFactory("payment-worker-$accountName")
-    ) { _, _ -> decline("queue-full") }
+    )
+
+    init {
+        NamedThreadFactory("payment-dispatcher-$accountName").newThread { dispatcherLoop() }.start()
+    }
+
+    private fun acquireEmissionSlot(deadline: Long): Boolean {
+        val maxWaitMs = deadline - System.currentTimeMillis() - deadlineReserveMs
+        return maxWaitMs > 0 && emissionBucket.asBlocking()
+            .tryConsume(1, Duration.ofMillis(maxWaitMs))
+    }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
@@ -74,9 +95,12 @@ class PaymentExternalSystemAdapterImpl(
         .connectionPool(ConnectionPool(workerThreads, 60, TimeUnit.SECONDS))
         .build()
 
+    override fun canAcceptByDeadline(deadline: Long): Boolean =
+        System.currentTimeMillis() + taskQueue.size * minEmissionGapMs + admissionReserveMs <= deadline
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        executor.submit {
-            processPayment(paymentId, amount, paymentStartedAt, deadline)
+        if (!taskQueue.offer(PaymentTask(paymentId, amount, paymentStartedAt, deadline))) {
+            decline("queue-full")
         }
     }
 
@@ -84,26 +108,38 @@ class PaymentExternalSystemAdapterImpl(
         meterRegistry.counter("payments_declined", "account", accountName, "reason", reason).increment()
     }
 
-    private fun processPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        while (System.currentTimeMillis() + deadlineReserveMs <= deadline) {
-            if (!rateLimiter.acquirePermission()) {
-                decline("rate-limited")
+    private fun dispatcherLoop() {
+        while (true) {
+            try {
+                val task = taskQueue.poll(pollTimeoutMs, TimeUnit.MILLISECONDS) ?: continue
+                if (System.currentTimeMillis() + deadlineReserveMs > task.deadline) {
+                    decline("deadline-exceeded")
+                    continue
+                }
+                if (!acquireEmissionSlot(task.deadline)) {
+                    decline("deadline-exceeded")
+                    continue
+                }
+                attemptExecutor.execute { processPayment(task) }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
                 return
+            } catch (e: Exception) {
+                logger.error("[$accountName] dispatcher loop error", e)
             }
-            if (System.currentTimeMillis() + deadlineReserveMs > deadline) {
-                decline("deadline-exceeded")
-                return
+        }
+    }
+
+    private fun processPayment(task: PaymentTask) {
+        if (performPaymentAttempt(task.paymentId, task.amount, task.paymentStartedAt)) {
+            return
+        }
+        while (System.currentTimeMillis() + deadlineReserveMs <= task.deadline) {
+            Thread.sleep(retryBackoffMs)
+            if (!acquireEmissionSlot(task.deadline)) {
+                break
             }
-            if (!inFlight.tryAcquire(5, TimeUnit.SECONDS)) {
-                decline("no-free-slot")
-                return
-            }
-            val succeeded = try {
-                performPaymentAttempt(paymentId, amount, paymentStartedAt)
-            } finally {
-                inFlight.release()
-            }
-            if (succeeded) {
+            if (performPaymentAttempt(task.paymentId, task.amount, task.paymentStartedAt)) {
                 return
             }
         }
