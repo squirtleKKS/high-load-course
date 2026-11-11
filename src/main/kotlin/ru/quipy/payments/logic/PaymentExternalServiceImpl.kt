@@ -52,7 +52,7 @@ class PaymentExternalSystemAdapterImpl(
     ).toInt()
     private val queueCapacity = 512
     private val pollTimeoutMs = 50L
-    private val retryBackoffMs = 400L
+    private val retryBackoffMs = 200L
     private val minEmissionGapMs = 1000L / rateLimitPerSec + 1
 
     private val emissionBucket: Bucket = Bucket.builder()
@@ -131,11 +131,13 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun processPayment(task: PaymentTask) {
+        var backoff = retryBackoffMs
         if (performPaymentAttempt(task.paymentId, task.amount, task.paymentStartedAt)) {
             return
         }
         while (System.currentTimeMillis() + deadlineReserveMs <= task.deadline) {
-            Thread.sleep(retryBackoffMs)
+            Thread.sleep(backoff)
+            backoff *= 2
             if (!acquireEmissionSlot(task.deadline)) {
                 break
             }

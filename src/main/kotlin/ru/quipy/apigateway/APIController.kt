@@ -31,7 +31,7 @@ class APIController {
         .addLimit(
             Bandwidth.builder()
                 .capacity(300)
-                .refillGreedy(11, Duration.ofSeconds(1))
+                .refillGreedy(10, Duration.ofSeconds(1))
                 .build()
         )
         .build()
